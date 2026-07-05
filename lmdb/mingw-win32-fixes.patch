@@ -1,0 +1,83 @@
+diff --git a/libraries/liblmdb/mdb.c b/libraries/liblmdb/mdb.c
+index 0e8f6212de..5c5ca124b7 100644
+--- a/libraries/liblmdb/mdb.c
++++ b/libraries/liblmdb/mdb.c
+@@ -11614,10 +11614,15 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
+ #endif
+ #if MDB_RPAGE_CACHE
+ #ifdef _WIN32
+-	LARGE_INTEGER	off = 0;
++	LARGE_INTEGER	off = {0};
++	SIZE_T	mlen;
++#define OFF_ADD(off,val)	off.QuadPart += (val)
+ #else
+ 	off_t	off = 0;
++	size_t	mlen;
++#define OFF_ADD(off,val)	off += (val)
+ #endif
++	void	*mptr;
+ #endif
+ 
+ 	/* Do the lock/unlock of the reader mutex before starting the
+@@ -11678,7 +11683,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
+ 	}
+ #if MDB_RPAGE_CACHE
+ 	if (MDB_REMAPPING(env->me_flags)) {
+-		off = wsize;
++		SET_OFF(off, wsize);
+ 	}
+ #endif
+ 	wsize = w3 - wsize;
+@@ -11686,7 +11691,9 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
+ 		w2 = (wsize > MAX_WRITE) ? MAX_WRITE : wsize;
+ #if MDB_RPAGE_CACHE
+ 		if (MDB_REMAPPING(env->me_flags)) {
+-			MAP(rc, env, ptr, w2, off);
++			mlen = w2;
++			MAP(rc, env, mptr, mlen, off);
++			ptr = mptr;
+ 		}
+ #endif
+ 		DO_WRITE(rc, fd, ptr, w2, len);
+@@ -11704,7 +11711,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
+ 			wsize -= len;
+ #if MDB_RPAGE_CACHE
+ 			if (MDB_REMAPPING(env->me_flags)) {
+-				off += len;
++				OFF_ADD(off, len);
+ 			}
+ #endif
+ 			continue;
+@@ -11946,7 +11953,7 @@ mdb_env_incr_loadfd(MDB_env *env, HANDLE fd)
+ 		return ENOMEM;
+ 
+ #ifdef _WIN32
+-		SetFilePointerEx(env->me_fd, 0, NULL, FILE_BEGIN);
++		{ LARGE_INTEGER li0; li0.QuadPart = 0; SetFilePointerEx(env->me_fd, li0, NULL, FILE_BEGIN); }
+ #else
+ 		lseek(env->me_fd, 0, SEEK_SET);
+ #endif
+@@ -12011,15 +12018,19 @@ mdb_env_incr_loadfd(MDB_env *env, HANDLE fd)
+ 			ptr += rlen;
+ 			rsize -= rlen;
+ 		}
+-		off = (pg-prevpg-numprev) * env->me_psize;
+-		rsize = numpgs * env->me_psize;
+-		if (off) {
+ #ifdef _WIN32
++		off.QuadPart = (pg-prevpg-numprev) * env->me_psize;
++		rsize = numpgs * env->me_psize;
++		if (off.QuadPart) {
+ 			SetFilePointerEx(env->me_fd, off, NULL, FILE_CURRENT);
++		}
+ #else
++		off = (pg-prevpg-numprev) * env->me_psize;
++		rsize = numpgs * env->me_psize;
++		if (off) {
+ 			lseek(env->me_fd, off, SEEK_CUR);
+-#endif
+ 		}
++#endif
+ 		ptr = pbuf;
+ 		while (rsize > 0) {
+ 			w2 = (rsize > MAX_WRITE) ? MAX_WRITE: rsize;
