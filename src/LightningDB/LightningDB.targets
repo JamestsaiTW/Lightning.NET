@@ -3,7 +3,10 @@
   <PropertyGroup>
     <LightningDBTargetRuntimeRelativePath Condition=" '$(LightningDBTargetRuntimeRelativePath)' == '' ">\..\</LightningDBTargetRuntimeRelativePath>
   </PropertyGroup>
-	<Target Name="LightningDBIncludeNativeDll" AfterTargets="BeforeResolveReferences">
+	<!-- Desktop-only: on browser-wasm the native library is compiled from source
+	     via buildTransitive/LightningDB.targets, and copying a host-OS binary to
+	     the output would be wrong. -->
+	<Target Name="LightningDBIncludeNativeDll" AfterTargets="BeforeResolveReferences" Condition="'$(RuntimeIdentifier)' != 'browser-wasm'">
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)$(LightningDBTargetRuntimeRelativePath)runtimes\win-x86\native\*" 
           CopyToOutputDirectory="PreserveNewest" 
