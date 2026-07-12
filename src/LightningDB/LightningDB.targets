@@ -3,7 +3,7 @@
   <PropertyGroup>
     <LightningDBTargetRuntimeRelativePath Condition=" '$(LightningDBTargetRuntimeRelativePath)' == '' ">\..\</LightningDBTargetRuntimeRelativePath>
   </PropertyGroup>
-	<!-- PackageReference resolves native assets for the consuming application's RID. -->
+	<!-- For PackageReference consumers, the SDK resolves runtimes/{rid}/native assets for the app's RID; set LightningDBEnableNativeCopyTarget=true to force the legacy copy behavior (e.g. packages.config or ProjectReference builds). -->
 	<Target Name="LightningDBIncludeNativeDll"
           AfterTargets="BeforeResolveReferences"
           Condition="'$(LightningDBEnableNativeCopyTarget)' == 'true' Or ('$(RestoreProjectStyle)' != 'PackageReference' And '@(PackageReference)' == '')">
