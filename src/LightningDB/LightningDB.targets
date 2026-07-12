@@ -3,7 +3,10 @@
   <PropertyGroup>
     <LightningDBTargetRuntimeRelativePath Condition=" '$(LightningDBTargetRuntimeRelativePath)' == '' ">\..\</LightningDBTargetRuntimeRelativePath>
   </PropertyGroup>
-	<Target Name="LightningDBIncludeNativeDll" AfterTargets="BeforeResolveReferences">
+	<!-- PackageReference resolves native assets for the consuming application's RID. -->
+	<Target Name="LightningDBIncludeNativeDll"
+          AfterTargets="BeforeResolveReferences"
+          Condition="'$(LightningDBEnableNativeCopyTarget)' == 'true' Or ('$(RestoreProjectStyle)' != 'PackageReference' And '@(PackageReference)' == '')">
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)$(LightningDBTargetRuntimeRelativePath)runtimes\win-x86\native\*" 
           CopyToOutputDirectory="PreserveNewest" 
