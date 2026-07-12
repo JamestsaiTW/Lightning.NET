@@ -1,0 +1,119 @@
+# Fork-only verification workflow for issue #205 (cross-arch native lib resolution).
+#
+# NOT intended to be submitted upstream: this reproduces the App -> Library
+# (ProjectReference) -> LightningDB (PackageReference) scenario from the issue and
+# publishes it for several RIDs, verifying that the native asset copied into the
+# publish output matches the correct RID's binary shipped in the package (not the
+# build-machine's architecture). Drop this file before opening an upstream PR.
+
+name: Cross-Arch Native Asset Verify (fork only)
+
+on:
+  push:
+    branches: [ targets-cross-arch-publish ]
+  pull_request:
+    branches: [ targets-cross-arch-publish ]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rid: [win-x86, win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64]
+    steps:
+      - name: Checkout Lightning.NET
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            10.0.x
+            9.0.x
+            8.0.x
+
+      - name: Pack LightningDB
+        run: dotnet pack src/LightningDB/LightningDB.csproj -c Release -o ${{ runner.temp }}/nupkg
+
+      - name: Scaffold App -> Library -> PackageReference(LightningDB) repro
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/repro"
+          mkdir -p "$ROOT"
+          cd "$ROOT"
+          dotnet new console -n App -o App
+          dotnet new classlib -n Library -o Library
+          dotnet add App/App.csproj reference Library/Library.csproj
+
+          PKG_VERSION=$(ls "${{ runner.temp }}/nupkg" | grep -oP '(?<=LightningDB\.)[0-9][0-9a-zA-Z.\-]*(?=\.nupkg)')
+          echo "Packed version: $PKG_VERSION"
+
+          cat > NuGet.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="${{ runner.temp }}/nupkg" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          EOF
+
+          dotnet add Library/Library.csproj package LightningDB --version "$PKG_VERSION" --source "${{ runner.temp }}/nupkg"
+          echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+
+      - name: Publish for ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/repro"
+          dotnet publish "$ROOT/App/App.csproj" -r ${{ matrix.rid }} --self-contained false \
+            -o "${{ runner.temp }}/publish/${{ matrix.rid }}"
+
+      - name: Verify correct native asset was selected
+        run: |
+          set -euo pipefail
+          RID="${{ matrix.rid }}"
+          PUBLISH_DIR="${{ runner.temp }}/publish/$RID"
+          NUPKG_DIR="${{ runner.temp }}/nupkg_extracted"
+          mkdir -p "$NUPKG_DIR"
+          NUPKG_FILE=$(ls "${{ runner.temp }}/nupkg"/LightningDB.*.nupkg | head -n1)
+          echo "Using nupkg: $NUPKG_FILE"
+          unzip -o -q "$NUPKG_FILE" -d "$NUPKG_DIR"
+          echo "--- nupkg runtimes/ contents ---"
+          find "$NUPKG_DIR/runtimes" -maxdepth 2 2>&1 || echo "(runtimes dir missing)"
+
+          # The packed nupkg only ships a generic "osx" runtime folder (covers
+          # both osx-x64 and osx-arm64 via the RID graph fallback), not "osx-x64".
+          case "$RID" in
+            win-*) NATIVE_NAME="lmdb.dll"; ASSET_RID="$RID" ;;
+            linux-*) NATIVE_NAME="liblmdb.so"; ASSET_RID="$RID" ;;
+            osx-x64) NATIVE_NAME="lmdb.dylib"; ASSET_RID="osx" ;;
+            osx-arm64) NATIVE_NAME="lmdb.dylib"; ASSET_RID="osx-arm64" ;;
+            *) echo "Unhandled RID $RID"; exit 1 ;;
+          esac
+
+          EXPECTED="$NUPKG_DIR/runtimes/$ASSET_RID/native/$NATIVE_NAME"
+          ACTUAL="$PUBLISH_DIR/$NATIVE_NAME"
+
+          if [ ! -f "$EXPECTED" ]; then
+            echo "::error::Expected reference native asset not found: $EXPECTED"
+            exit 1
+          fi
+          if [ ! -f "$ACTUAL" ]; then
+            echo "::error::Published output missing native asset: $ACTUAL"
+            exit 1
+          fi
+
+          EXPECTED_HASH=$(sha256sum "$EXPECTED" | cut -d' ' -f1)
+          ACTUAL_HASH=$(sha256sum "$ACTUAL" | cut -d' ' -f1)
+
+          echo "Expected ($RID): $EXPECTED_HASH"
+          echo "Actual   ($RID): $ACTUAL_HASH"
+
+          if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+            echo "::error::Native asset published for $RID does not match the expected runtimes/$RID/native/$NATIVE_NAME binary (issue #205 regression)"
+            exit 1
+          fi
+
+          echo "OK: $RID resolved the correct native asset."
