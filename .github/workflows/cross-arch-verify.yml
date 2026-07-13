@@ -1,0 +1,252 @@
+# Fork-only verification workflow for issue #205 (cross-arch native lib resolution).
+#
+# NOT intended to be submitted upstream: this reproduces the App -> Library
+# (ProjectReference) -> LightningDB (PackageReference) scenario from the issue and
+# publishes it for several RIDs, verifying that the native asset copied into the
+# publish output matches the correct RID's binary shipped in the package (not the
+# build-machine's architecture). Drop this file before opening an upstream PR.
+
+name: Cross-Arch Native Asset Verify (fork only)
+
+on:
+  push:
+    branches: [ targets-cross-arch-publish ]
+  pull_request:
+    branches: [ targets-cross-arch-publish ]
+  workflow_dispatch:
+
+jobs:
+  verify-cross-rid:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rid: [win-x86, win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64]
+    steps:
+      - name: Checkout Lightning.NET
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            10.0.x
+            9.0.x
+            8.0.x
+
+      - name: Pack LightningDB
+        run: dotnet pack src/LightningDB/LightningDB.csproj -c Release -p:PackageVersion=0.22.0-pr206-ci -o ${{ runner.temp }}/nupkg
+
+      - name: Scaffold App -> Library -> PackageReference(LightningDB) repro
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/repro"
+          mkdir -p "$ROOT"
+          cd "$ROOT"
+          dotnet new console -n App -o App
+          dotnet new classlib -n Library -o Library
+          dotnet new console -n Direct -o Direct
+          dotnet add App/App.csproj reference Library/Library.csproj
+
+          PKG_VERSION=$(ls "${{ runner.temp }}/nupkg" | grep -oP '(?<=LightningDB\.)[0-9][0-9a-zA-Z.\-]*(?=\.nupkg)')
+          echo "Packed version: $PKG_VERSION"
+
+          cat > NuGet.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="${{ runner.temp }}/nupkg" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          EOF
+
+          dotnet add Library/Library.csproj package LightningDB --version "$PKG_VERSION" --source "${{ runner.temp }}/nupkg"
+          dotnet add Direct/Direct.csproj package LightningDB --version "$PKG_VERSION" --source "${{ runner.temp }}/nupkg"
+          echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify RID-less class library does not copy a host asset
+        if: matrix.rid == 'linux-arm64'
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/repro"
+          OUTPUT="${{ runner.temp }}/library-output"
+          dotnet build "$ROOT/Library/Library.csproj" -c Release -o "$OUTPUT"
+          if find "$OUTPUT" -maxdepth 1 -type f \( -name 'lmdb.dll' -o -name 'liblmdb.so' -o -name 'lmdb.dylib' \) | grep -q .; then
+            echo "::error::RID-less class library copied a host-native asset"
+            exit 1
+          fi
+
+      - name: Publish direct and transitive consumers for ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/repro"
+          dotnet publish "$ROOT/App/App.csproj" -r ${{ matrix.rid }} --self-contained false \
+            -o "${{ runner.temp }}/publish/transitive/${{ matrix.rid }}"
+          dotnet publish "$ROOT/Direct/Direct.csproj" -r ${{ matrix.rid }} --self-contained false \
+            -o "${{ runner.temp }}/publish/direct/${{ matrix.rid }}"
+
+      - name: Verify correct native assets were selected
+        run: |
+          set -euo pipefail
+          RID="${{ matrix.rid }}"
+          NUPKG_DIR="${{ runner.temp }}/nupkg_extracted"
+          mkdir -p "$NUPKG_DIR"
+          NUPKG_FILE=$(ls "${{ runner.temp }}/nupkg"/LightningDB.*.nupkg | head -n1)
+          echo "Using nupkg: $NUPKG_FILE"
+          unzip -o -q "$NUPKG_FILE" -d "$NUPKG_DIR"
+          echo "--- nupkg runtimes/ contents ---"
+          find "$NUPKG_DIR/runtimes" -maxdepth 2 2>&1 || echo "(runtimes dir missing)"
+
+          # The packed nupkg only ships a generic "osx" runtime folder (covers
+          # both osx-x64 and osx-arm64 via the RID graph fallback), not "osx-x64".
+          case "$RID" in
+            win-*) NATIVE_NAME="lmdb.dll"; ASSET_RID="$RID" ;;
+            linux-*) NATIVE_NAME="liblmdb.so"; ASSET_RID="$RID" ;;
+            osx-x64) NATIVE_NAME="lmdb.dylib"; ASSET_RID="osx" ;;
+            osx-arm64) NATIVE_NAME="lmdb.dylib"; ASSET_RID="osx-arm64" ;;
+            *) echo "Unhandled RID $RID"; exit 1 ;;
+          esac
+
+          EXPECTED="$NUPKG_DIR/runtimes/$ASSET_RID/native/$NATIVE_NAME"
+          if [ ! -f "$EXPECTED" ]; then
+            echo "::error::Expected reference native asset not found: $EXPECTED"
+            exit 1
+          fi
+
+          RESOLVED_RID=$(dotnet msbuild "${{ runner.temp }}/repro/Direct/Direct.csproj" \
+            -nologo -verbosity:quiet -t:LightningDBIncludeNativeDll -p:RuntimeIdentifier="$RID" \
+            -getProperty:_LightningDBNativeAssetRuntimeIdentifier |
+            jq -r '.Properties._LightningDBNativeAssetRuntimeIdentifier')
+          if [ "$RESOLVED_RID" != "$ASSET_RID" ]; then
+            echo "::error::Target resolved $RID to '$RESOLVED_RID' instead of '$ASSET_RID'"
+            exit 1
+          fi
+
+          EXPECTED_HASH=$(sha256sum "$EXPECTED" | cut -d' ' -f1)
+          echo "Expected ($RID): $EXPECTED_HASH"
+
+          for KIND in direct transitive; do
+            PUBLISH_DIR="${{ runner.temp }}/publish/$KIND/$RID"
+            ACTUAL="$PUBLISH_DIR/$NATIVE_NAME"
+            if [ ! -f "$ACTUAL" ]; then
+              echo "::error::$KIND publish output is missing native asset: $ACTUAL"
+              exit 1
+            fi
+
+            ACTUAL_HASH=$(sha256sum "$ACTUAL" | cut -d' ' -f1)
+            echo "$KIND ($RID): $ACTUAL_HASH"
+            if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+              echo "::error::$KIND publish for $RID does not match runtimes/$ASSET_RID/native/$NATIVE_NAME"
+              exit 1
+            fi
+
+            for COMPETING_NAME in lmdb.dll liblmdb.so lmdb.dylib; do
+              if [ "$COMPETING_NAME" != "$NATIVE_NAME" ] && [ -f "$PUBLISH_DIR/$COMPETING_NAME" ]; then
+                echo "::error::$KIND publish contains competing host-native asset $COMPETING_NAME"
+                exit 1
+              fi
+            done
+          done
+
+          test -f "$NUPKG_DIR/build/LightningDB.targets"
+          NATIVE_COUNT=$(find "$NUPKG_DIR/runtimes" -type f -path '*/native/*' | wc -l)
+          test "$NATIVE_COUNT" -eq 16
+          echo "OK: $RID resolved the correct native asset for direct and transitive consumers."
+
+  verify-windows-selection:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Lightning.NET
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            10.0.x
+            9.0.x
+            8.0.x
+
+      - name: Pack LightningDB
+        shell: pwsh
+        run: dotnet pack src\LightningDB\LightningDB.csproj -c Release -p:PackageVersion=0.22.0-pr206-ci -o "${{ runner.temp }}\nupkg"
+
+      - name: Verify PlatformTarget, Prefer32Bit, and host fallback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path '${{ runner.temp }}' 'windows-selection'
+          $packageSource = Join-Path '${{ runner.temp }}' 'nupkg'
+          $packagesPath = Join-Path $root 'packages'
+          $extracted = Join-Path $root 'extracted'
+          $projectDirectory = Join-Path $root 'Direct'
+          $project = Join-Path $projectDirectory 'Direct.csproj'
+          $libraryDirectory = Join-Path $root 'Library'
+          $libraryProject = Join-Path $libraryDirectory 'Library.csproj'
+          $config = Join-Path $root 'nuget.config'
+
+          function Invoke-DotNet {
+            & dotnet @args
+            if ($LASTEXITCODE -ne 0) {
+              throw "dotnet $($args -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          function Assert-NativeAsset([string] $output, [string] $assetRid) {
+            $expected = Join-Path $extracted "runtimes\$assetRid\native\lmdb.dll"
+            $actual = Join-Path $output 'lmdb.dll'
+            if (-not (Test-Path -LiteralPath $actual)) {
+              throw "$actual was not copied"
+            }
+            if ((Get-FileHash -LiteralPath $actual).Hash -ne (Get-FileHash -LiteralPath $expected).Hash) {
+              throw "$actual does not match runtimes\$assetRid\native\lmdb.dll"
+            }
+          }
+
+          New-Item -ItemType Directory -Path $root, $packagesPath, $extracted | Out-Null
+          Invoke-DotNet new nugetconfig --output $root --force
+          Invoke-DotNet nuget add source $packageSource --name local --configfile $config
+          Invoke-DotNet new console --framework net10.0 --no-restore --output $projectDirectory
+          Invoke-DotNet new classlib --framework net10.0 --no-restore --output $libraryDirectory
+          Invoke-DotNet add $project package LightningDB --version 0.22.0-pr206-ci --no-restore
+          Invoke-DotNet add $libraryProject package LightningDB --version 0.22.0-pr206-ci --no-restore
+
+          $nupkg = Get-ChildItem -LiteralPath $packageSource -Filter 'LightningDB.0.22.0-pr206-ci.nupkg' | Select-Object -First 1
+          $zip = Join-Path $root 'LightningDB.zip'
+          Copy-Item -LiteralPath $nupkg.FullName -Destination $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $extracted
+
+          Invoke-DotNet restore $project --configfile $config --packages $packagesPath --no-cache
+          Invoke-DotNet restore $libraryProject --configfile $config --packages $packagesPath --no-cache
+
+          $libraryItemsJson = & dotnet msbuild $libraryProject -nologo -t:LightningDBIncludeNativeDll -p:PlatformTarget=x86 -getItem:None
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inspecting RID-less library items failed with exit code $LASTEXITCODE"
+          }
+          $libraryItems = (($libraryItemsJson -join "`n") | ConvertFrom-Json).Items.None
+          $nativeItems = @($libraryItems) | Where-Object { $_.Identity -match '[\\/]runtimes[\\/].*[\\/]native[\\/]' }
+          if ($nativeItems.Count -ne 0) {
+            throw 'RID-less PlatformTarget=x86 class library added a host-native None item'
+          }
+          Write-Output 'PASS: RID-less PlatformTarget=x86 class library did not add a host-native item.'
+
+          $cases = @(
+            @{ Name = 'platform-x86'; Rid = 'win-x86'; Properties = @('-p:PlatformTarget=x86') },
+            @{ Name = 'platform-x64'; Rid = 'win-x64'; Properties = @('-p:PlatformTarget=x64') },
+            @{ Name = 'platform-arm64'; Rid = 'win-arm64'; Properties = @('-p:PlatformTarget=ARM64') },
+            @{ Name = 'host-fallback'; Rid = 'win-x64'; Properties = @() }
+          )
+          foreach ($case in $cases) {
+            $output = Join-Path $root $case.Name
+            $buildArguments = @('build', $project, '--configuration', 'Release', '--no-restore', '--output', $output, "-p:RestorePackagesPath=$packagesPath") + $case.Properties
+            Invoke-DotNet @buildArguments
+            Assert-NativeAsset $output $case.Rid
+            Write-Output "PASS: $($case.Name) selected $($case.Rid)."
+          }
+
+          Invoke-DotNet restore $project --configfile $config --packages $packagesPath --no-cache '-p:TargetFramework=net48' '-p:PlatformTarget=AnyCPU' '-p:Prefer32Bit=true'
+          $prefer32BitOutput = Join-Path $root 'prefer-32-bit'
+          Invoke-DotNet build $project --configuration Release --no-restore --output $prefer32BitOutput "-p:RestorePackagesPath=$packagesPath" '-p:TargetFramework=net48' '-p:LangVersion=latest' '-p:PlatformTarget=AnyCPU' '-p:Prefer32Bit=true'
+          Assert-NativeAsset $prefer32BitOutput 'win-x86'
+          Write-Output 'PASS: net48 Prefer32Bit selected win-x86.'
