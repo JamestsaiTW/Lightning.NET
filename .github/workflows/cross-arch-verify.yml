@@ -115,7 +115,7 @@ jobs:
           fi
 
           RESOLVED_RID=$(dotnet msbuild "${{ runner.temp }}/repro/Direct/Direct.csproj" \
-            -nologo -t:LightningDBIncludeNativeDll -p:RuntimeIdentifier="$RID" \
+            -nologo -verbosity:quiet -t:LightningDBIncludeNativeDll -p:RuntimeIdentifier="$RID" \
             -getProperty:_LightningDBNativeAssetRuntimeIdentifier |
             jq -r '.Properties._LightningDBNativeAssetRuntimeIdentifier')
           if [ "$RESOLVED_RID" != "$ASSET_RID" ]; then
